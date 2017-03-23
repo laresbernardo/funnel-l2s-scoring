@@ -1,0 +1,516 @@
+---
+title: "Funnel L2S Model"
+author: "Bernardo Lares"
+date: "22/3/2017"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Modelo Lead To Sale (L2S)
+
+En este documento resumiré los pasos seguidos para la generación del score generado con el **Funnel L2S Model** de X empresa, en el cual logramos calcular cuál es la probabilidad de que un lead o una oportunidad nueva vaya a convertir (comprar una póliza todo riesgo) y poder tomar mejores decisiones basadas en Machine Learning.
+
+**NOTA**:Hay que tomar en cuenta que este score no varía con el tiempo ya que sólo tiene información referente a la persona como tal y no a su comportamiento.
+
+El algorítmo definitivo empleado para generar los scores fue **XGBoost**, utilizando R (sampling, limpieza de data y modelo) y Python (implementación en el CRM).
+
+## Sampling
+
+Las librerías empleadas fueron las siguientes:
+
+```{r include=TRUE,message = FALSE}
+library(RPostgreSQL)
+library(dplyr)
+library(stringr)
+library(Amelia)
+library(ggplot2)
+library(gridExtra)
+```
+
+Luego, se trajo la data del servidor a R directamente usando **PostgreSQL** (se omite el código por motivos de seguridad). Las consultas realizadas de una tabla compuesta por las siguientes dos categorías:
+
+1. **Emitidas (1)**: toda la data de todas las oportunidades que fueron emitidas entre el '2016-01-01' y '2017-01-27' (3 semanas antes de la generación del sample).
+2. **No emitidas (0)**: selección aleatoria de oportuniades, dentro del mismo rango de fechas que no fueron emitidas, limitado a 5000.
+
+```{r include=FALSE}
+setwd("/Users/bernardo/Dropbox (ID)/CM Analisis/Model 2017/Funnel L2S Scoring/R Markdown/")
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, 
+                 host="172.30.0.113", 
+                 dbname="sd", 
+                 port="5432", 
+                 user="oisdfhsbcsdsio", 
+                 password="b34678wtbiu3")
+
+```
+
+
+```{r include=TRUE}
+## EMITIDAS
+q <- "
+SELECT 
+DISTINCT(o.id),
+random(),
+o.created,
+app.vehicle_body,
+app.sex,
+EXTRACT(year from app.date_of_birth) as year_of_birth,
+app.vehicle_model,
+app.vehicle_city,
+app.current_situation,
+app.vehicle_is_mine,
+app.form,
+app.already_insured_soat,
+app.when_need_policy,
+app.vehicle_financed,
+app.vehicle_commercial_value,
+app.identification,
+app.vehicle_is_zero_km,
+app.vehicle_has_registration,
+app.client_type,
+app.vehicle_service_type,
+CASE WHEN app.already_insured_with_company IS NOT NULL THEN 'SI' 
+  ELSE 'NO' END as already_insured,
+m.medium,
+app.vehicle_brand,
+o.quoted_policies_count
+
+FROM applications_carinsuranceapplication as app
+LEFT JOIN opportunities_opportunity as o ON (app.id = o.application_object_id) 
+LEFT JOIN opportunities_userjourney as uj ON (o.id = uj.opportunity_id) 
+LEFT JOIN opportunities_userjourneystepdone as sd ON (uj.id = sd.user_journey_id) 
+LEFT JOIN marketing_visitor as m ON (o.marketing_id = m.id)
+
+WHERE 
+sd.name IN ('issue') 
+AND o.created BETWEEN '2016-01-01' AND (CURRENT_DATE - INTERVAL '1 month')
+AND o.fake = FALSE
+AND m.medium != 'api'
+AND app.form NOT IN ('default','ux31')
+AND o.status != 'descartada'
+ORDER BY random()
+LIMIT 10000"
+q <- dbSendQuery(con, q)
+emitidos <- fetch(q, n = -1)
+emitidos$emitido <- c(1)
+emitidos <- head(emitidos,6000) #Cuántos registros máximos queremos para "1s"
+
+## NO EMITIDAS
+q <- "
+SELECT 
+DISTINCT(o.id),
+random(),
+o.created,
+app.vehicle_body,
+app.sex,
+EXTRACT(year from app.date_of_birth) as year_of_birth,
+app.vehicle_model,
+app.vehicle_city,
+app.current_situation,
+app.vehicle_is_mine,
+app.form,
+app.already_insured_soat,
+app.when_need_policy,
+app.vehicle_financed,
+app.vehicle_commercial_value,
+app.identification,
+app.vehicle_is_zero_km,
+app.vehicle_has_registration,
+app.client_type,
+app.vehicle_service_type,
+CASE WHEN app.already_insured_with_company IS NOT NULL THEN 'SI' 
+  ELSE 'NO' END as already_insured,
+m.medium,
+app.vehicle_brand,
+o.quoted_policies_count
+
+FROM applications_carinsuranceapplication as app
+LEFT JOIN opportunities_opportunity as o ON (app.id = o.application_object_id) 
+LEFT JOIN opportunities_userjourney as uj ON (o.id = uj.opportunity_id) 
+LEFT JOIN opportunities_userjourneystepdone as sd ON (uj.id = sd.user_journey_id) 
+LEFT JOIN marketing_visitor as m ON (o.marketing_id = m.id)
+
+WHERE 
+sd.name NOT IN ('issue','terms','payment','docs-physics','acquired','fin') 
+AND o.created BETWEEN '2016-01-01' AND (CURRENT_DATE - INTERVAL '1 month')
+AND o.fake = FALSE
+AND m.medium != 'api'
+AND app.form NOT IN ('default','ux31')
+AND o.status != 'descartada'
+ORDER BY random() 
+LIMIT 8000"
+q <- dbSendQuery(con, q)
+no.emitidos <- fetch(q, n = -1)
+no.emitidos <- filter(no.emitidos,!id %in% emitidos$id)
+no.emitidos$emitido <- c(0)
+no.emitidos <- head(no.emitidos,5000) #Cuántos registros máximos queremos para "0s"
+
+## JOIN BOTH
+sample <- rbind(emitidos,no.emitidos)
+## Delete random()
+sample$random <- NULL
+#Reordenar
+sample <- cbind(select(sample,emitido,id,created),select(sample,-emitido,-id,-created))
+
+## EXPORT RAW
+write.csv2(sample,"Data.16.raw.csv")
+```
+
+Ahora vemos la data que exportamos del servidor a un archivo CSV:
+
+```{r include=TRUE}
+str(sample)
+head(sample,1)
+sample %>% group_by(emitido) %>% tally()
+```
+
+## Limpieza y preparación de la data
+
+Ahora que tenemos ya el extracto de la data que usaremos para el modelo, preparamos los campos que requieran organizar, limpiar, mejorar...
+
+```{r include=TRUE}
+df.train <- read.csv2('Data.16.raw.csv',stringsAsFactors=TRUE)
+df.train$X <- NULL #No nos sirve
+df.train$civil_status <- NULL #Mala data
+df.train$email_address <- NULL #Mal predictor
+df.train$domain <- NULL #Mal predictor
+df.train$mobile_phone <- NULL #Mal predictor
+df.train$phone <- NULL #Mal predictor
+
+#Missing values
+missmap(df.train,legend=FALSE,rank.order=TRUE)
+
+#CIUDADES
+#Fix data
+df.train$vehicle_city <- sub(", Colombia","",df.train$vehicle_city)
+df.train$vehicle_city <- sub(", .*","",df.train$vehicle_city)
+#View data - Ciudad
+fix <- as.data.frame(df.train$vehicle_city)
+fix <- fix %>% group_by(Campo=fix[,1]) %>% tally(sort = TRUE) %>%
+  mutate(Perc=round(n/nrow(fix),2)) %>% top_n(10,n)
+print(fix)
+#Reescribir las campos por nueva agrupación
+df.train <- df.train %>%
+  mutate(vehicle_city = ifelse(vehicle_city=="Bogotá","BOG",
+                               ifelse(vehicle_city=="Medellín","MED",
+                                      ifelse(vehicle_city=="Cali","CAL",
+                                             ifelse(vehicle_city=="Barranquilla","BAR","OTRA")))))
+
+# NACIMIENTO - EDAD
+df.train$year_of_birth[is.na(df.train$year_of_birth)] <- as.integer(format(Sys.time(), "%Y")) #NAs
+df.train$edad <- as.integer(format(Sys.time(), "%Y")) - df.train$year_of_birth #Edades
+df.train$year_of_birth <- NULL
+df.train <- df.train %>%
+  mutate(edad = ifelse(edad>=80,">80",
+                       ifelse(edad>=55,"55-79",
+                              ifelse(edad>=40,"40-54",
+                                     ifelse(edad>=30,"30-39",
+                                            ifelse(edad>=18,"18-29",
+                                                   ifelse(edad>=1,"MENOR","SIN")))))))
+
+# MODELO DEL VEHÍCULO
+fix <- as.data.frame(df.train$vehicle_model)
+fix <- fix %>% group_by(Campo=fix[,1]) %>% tally(sort = TRUE) %>% 
+  mutate(Perc=round(n/nrow(fix),2)) %>% top_n(10,n)
+print(fix)
+#Reescribir las campos por nueva agrupación
+año <- as.integer(format(Sys.Date(), "%Y"))
+df.train <- df.train %>%
+  mutate(vehicle_model = ifelse(vehicle_model>=año,"DEL.AÑO",
+                                ifelse(vehicle_model>=(año-1),"AÑO.PASADO",
+                                       ifelse(vehicle_model>=(año-2),"AÑO.ANTEPASADO",
+                                              ifelse(vehicle_model>=(año-5),"5.AÑOS",
+                                                     ifelse(vehicle_model>=(año-10),"10.AÑOS","MAS.10.AÑOS"))))))
+
+# MEDIUM
+fix <- as.data.frame(df.train$medium)
+fix <- fix %>% group_by(Campo=fix[,1]) %>% tally(sort = TRUE) %>% 
+  mutate(Perc=round(n/nrow(fix),2)) %>% top_n(10,n)
+print(fix)
+#Reescribir las campos por nueva agrupación
+df.train <- df.train %>%
+  mutate(medium = ifelse(medium=="cpc","SEM",
+                         ifelse(medium=="direct","DIRECT",
+                                ifelse(medium=="seo","SEO",
+                                       ifelse(medium=="et","ET",
+                                              ifelse(medium=="referral","REFERRAL",
+                                                     ifelse(medium=="INBOXLABS","INBOXLABS","OTRO")))))))
+
+# BODY
+fix <- as.data.frame(df.train$vehicle_body)
+fix <- fix %>% group_by(Campo=fix[,1]) %>% tally(sort = TRUE) %>% 
+  mutate(Perc=round(n/nrow(fix),2)) %>% top_n(10,n)
+print(fix)
+#Reescribir las campos por nueva agrupación
+df.train <- df.train %>%
+  mutate(vehicle_body = ifelse(vehicle_body=="AUTOMOVIL","AUTOMOVIL",
+                               ifelse(vehicle_body=="CAMIONETA","CAMIONETA",
+                                      ifelse(vehicle_body=="MOTO","MOTO",
+                                             ifelse(vehicle_body=="CAMPERO","CAMPERO",
+                                                    ifelse(vehicle_body=="CAMIONETA PASAJ.","CAMIONETA PASAJ.",
+                                                           ifelse(vehicle_body=="PICKUP","PICKUP","OTRO")))))))
+
+# IDENTIFICACIÓN
+fix <- as.data.frame(df.train$identification)
+fix <- fix %>% group_by(Campo=fix[,1]) %>% tally(sort = TRUE) %>% 
+  mutate(Perc=round(n/nrow(fix),2)) %>% top_n(5,n)
+print(fix)
+#Reescribir las campos por nueva agrupación
+df.train <- df.train %>% mutate(identification = ifelse(as.integer(identification)==1,0,1))
+df.train$identification[is.na(df.train$identification)] <- 0
+
+# CREATED (Día de semana)
+df.train$weekday <- weekdays(as.Date(df.train$created,format='%Y-%m-%d',tz="BO"))
+
+#Clases de los campos
+for(i in c(1,1:ncol(df.train))) {
+  df.train[,i] <- as.factor(df.train[,i])
+}
+df.train[,2] <- as.integer(as.character(df.train[,2]))
+
+## EXPORT CLEAN
+write.csv2(df.train,"Data.16.clean.csv")
+str(df.train)
+```
+
+
+## Creación del Modelo
+
+Una vez tenemos la data lista para nuestro modelo, podemos entrenarlo, ajustarlo y conseguir los mejores resultados.
+
+Las librerías empleadas son las siguientes:
+
+```{r include=TRUE,message = FALSE}
+library(dplyr)
+library(xgboost)
+library(data.table)
+library(caTools)
+library(pROC)
+library(gridExtra)
+library(caret)
+library(ggplot2)
+```
+
+Importamos la data limpia para el modelo:
+
+```{r include=TRUE}
+df.train <- read.csv2('Data.16.clean.csv',stringsAsFactors=TRUE,na=as.factor("NULO"))
+fechas <- paste(min(as.Date(df.train$created)),"-",max(as.Date(df.train$created)))
+df.train$X <- NULL
+df.train$vehicle_commercial_value <- as.numeric(as.character(df.train$vehicle_commercial_value))
+df.train$vehicle_brand <- NULL #Noice
+```
+
+## Train y Test Data
+
+Dividimos la data en train (para entrenamiento) y test (para las pruebas), con una relación de 30/70.
+
+```{r include=TRUE}
+set.seed(1)
+split <- sample.split(df.train$emitido, SplitRatio = 0.7) 
+train <- subset(df.train, split == TRUE) #Training
+test <- subset(df.train, split == FALSE) #Testing
+
+n <- nrow(test)
+emitidos <- nrow(filter(test,emitido==1))
+```
+
+## One Hot Encoding para trabajar con XGBoost
+
+Una vez tengamos nuestra data segmentada, la preparamos para XGBoost:
+
+```{r include=TRUE}
+setDT(train)
+setDT(test)
+
+#One hot encoding
+labels <- train$emitido #Target train
+ts_label <- test$emitido #Target test
+new_tr <- model.matrix(~.+0,data = train[,-c("emitido","id","created"),with=F]) 
+new_ts <- model.matrix(~.+0,data = test[,-c("emitido","id","created"),with=F]) 
+
+#Convert data table into a matrix (xgb.DMatrix):
+dtrain <- xgb.DMatrix(data = new_tr,label = labels)
+dtest <- xgb.DMatrix(data = new_ts,label = ts_label)
+```
+
+## Parámetros iniciales para el modelo
+
+Definimos los valores de los parámetros para iniciar el modelo:
+
+```{r include=TRUE,message = FALSE}
+params <- list(
+  booster = "gbtree", # 'gbtree' / 'gblinear'
+  objective = "binary:logistic", # 'binary:logistic' / 'reg:linear'
+  eta=0.1, #Step size shrinkage (prevents overfitting) - default=0.3
+  gamma=0, #Minimum loss reduction required to split
+  max_depth=5, #Default=6 <- Complexity (ver xgb.plot.deepness)
+  min_child_weight=1,
+  subsample=1,#Robust to noise
+  colsample_bytree=1 #Robust to noise
+)
+```
+
+Hacemos cross-validation buscando la mejor iteración para este modelo. Además, podemos calcular el Accuracy del cross-validation.
+
+```{r include=TRUE,message = FALSE,}
+xgbcv <- xgb.cv(params = params,
+                data = dtrain,
+                nrounds = 150, #n iteraciones
+                nfold = 5, #folds cross validation
+                showsd = T,
+                stratified = T,
+                print_every_n = 1, #Intervalos a mostrar
+                early_stopping_rounds = 20, #20
+                maximize = F,
+                prediction = F)
+#The model returned lowest error @:
+bestn <- xgbcv$best_iteration #cambia cada vez = 68 empleado en CRM
+paste("Mejor iteración:",bestn)
+paste("CV Accuracy: ",round((1-min(xgbcv$evaluation_log$test_error_mean))*100,2),"%",sep="")
+```
+
+## Entrenamiento del modelo
+
+Y ahora, entrenamos nuestro modelo de pruebas y calculamos Accuracy:
+
+```{r include=TRUE,message = FALSE}
+xgb1 <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = bestn, #default=bestn para no hacer overfitting
+  watchlist = list(val=dtest,train=dtrain),
+  print_every_n = 1,
+  maximize = F,
+  eval_metric = "error"
+)
+```
+```{r include=TRUE}
+paste("Accuracy: ",round((1-min(xgb1$evaluation_log$val_error))*100,2),"%",sep="")
+```
+
+## Evaluación del modelo
+
+Una vez satisfechos con el valor obtenido de Accuracy, podemos empezar a evaluar, predecir, estudiar los resultados y exportarlo.
+
+```{r include=TRUE}
+result <- as.data.frame(cbind(id_opp=train$id,date=as.Date(train$created),real=train$emitido,score=predict(xgb1,dtrain)))
+result$date <- as.Date(result$date,origin='1970-01-01')
+head(result)
+
+threshold <- 0.3 #Definir threshold (0.5 es lo convencional pero depende del caso)
+result <- result %>% mutate(predicción=ifelse(score>=threshold,1,0))
+xgbpred <- predict(xgb1,dtest)
+xgbpred <- ifelse(xgbpred>threshold,1,0)
+mat <- xgb.importance(feature_names=colnames(new_tr),model=xgb1) # Importancia variables
+MC <- table(test$emitido, xgbpred > threshold)
+deciles <- quantile(result$score, probs = seq(0.1, 0.9, length = 9), names = TRUE)
+deciles <- data.frame(cbind(
+  Deciles=row.names(as.data.frame(deciles)),
+  Threshold=as.data.frame(deciles)),row.names=NULL)
+#Entonces, tenemos:
+resultados <- list("Mejor iteración + ACC"=
+                     paste(
+                       max(xgb1$evaluation_log$iter),'<-',
+                       round((1-min(xgb1$evaluation_log$val_error))*100,2),"%"),
+                   "Top 10 predictores"=mat[1:10,1:2],
+                   "Rango de fechas"=fechas,
+                   "% Relación Emitidas"=paste(
+                     round(emitidos/n,2),"<-",emitidos,"emitidos"),
+                   "Matriz de Confusión @Threshold"=MC,
+                   "Threshold empleada"=threshold,
+                   "Accuracy (ACC) @Threshold"=round((MC[1,1]+MC[2,2])/n,4),
+                   "% True Positives: emitida & gestionada"=MC[2,2]/emitidos,
+                   "% True: total gestionadas"=(MC[1,2]+MC[2,2])/n,
+                   "Curva ROC"=plot.roc(
+                     x=result$real,
+                     predictor=result$score,
+                     smooth=FALSE,auc=TRUE,ci=TRUE,print.auc=TRUE,percent=TRUE,grid=TRUE),
+                   "Deciles"=deciles)
+print(resultados)
+```
+
+
+## Gráficas para visualizar los resultados
+
+Veamos algunos gráficos:
+
+```{r include=TRUE}
+grid.arrange(arrangeGrob(
+  ggplot(mat[1:20,1:2],
+         aes(x=reorder(Feature,Gain),
+             y=Gain,
+             label=round(Gain,2),fill=as.numeric(Gain))) + 
+    geom_col() + coord_flip() + xlab('') + ylab('Importancia') + 
+    guides(fill=FALSE) + geom_text(hjust=-0.5)))
+
+ggplot(deciles, aes(
+  x=Deciles,
+  y=deciles,
+  label=round(deciles*100,2),fill=as.numeric(deciles))) + 
+  geom_col() + 
+  xlab('Threshold por deciles') + ylab('Corte del score') + 
+  guides(fill=FALSE) + geom_text(vjust=-1)
+
+grid.arrange(ggplot(as.data.frame(result))+
+               geom_histogram(
+                 aes(x=score),
+                 binwidth = 0.01, fill="black", color="white", alpha=0.5) + 
+               ylab("Contador") + xlab(''),
+             ggplot(filter(result,real==1)) + 
+               geom_histogram(
+                 aes(x=score),
+                 binwidth = 0.01, fill="blue", color="white", alpha=0.5) + 
+               xlab('') + ylab('Emitidos') + 
+               xlim(0, 1) + ylim(0,120), 
+             ggplot(filter(result,real==0)) + 
+               geom_histogram(
+                 aes(x=score),
+                 binwidth = 0.01, fill="red", color="white", alpha=0.5) + 
+               xlab('Score') + ylab('No emitidos') + 
+               xlim(0, 1) + ylim(0,120), ncol=1) 
+
+ggplot(select(result,real,round(score,2)) %>%
+         group_by(Score=round(score,2),Emisión=real) %>% tally()) + 
+  geom_bar(
+    aes(x=Score,y=n,fill = as.factor(Emisión)),stat="identity") + 
+  ylab('Frecuencia') + 
+  scale_x_continuous(breaks = round(seq(0, 1, by = 0.1),1)) +
+  theme(legend.position="bottom", legend.direction="horizontal", legend.title = element_blank())
+
+xgbi <- xgb.train(params = params,data = dtrain,
+  nrounds = 200, #default=bestn para no hacer overfitting
+  watchlist = list(val=dtest,train=dtrain),print_every_n = 1,maximize = F,eval_metric = "error")
+val_error <- as.data.frame(xgbi$evaluation_log$val_error)
+train_error <- as.data.frame(xgbi$evaluation_log$train_error)
+ggplot(val_error, aes(row(val_error))) + 
+  geom_line(aes(y = abs(val_error),color='red')) +
+  geom_line(aes(y = abs(train_error),color='blue')) +
+  xlab('Iteraciones') + ylab('Error') + 
+  ggtitle('Delta Train & Test Error') + guides(colour=FALSE) +
+  geom_vline(xintercept=bestn)  #bestn used in model
+```
+
+## Exportación del modelo
+
+Exportemos ahora nuestro modelo en formato binario para luego ser implementado en nuestro CRM usando Python y XGBoost.
+
+```{r include=TRUE}
+xgb.save(xgb1, fname="xgb1.model")
+# Chequeo si se exportó bien:
+pred <- predict(xgb1,dtrain)
+# Cargamos el modelo binario
+xgb2 <- xgb.load("xgb1.model")
+pred2 <- predict(xgb2, dtrain, ntreelimit = bestn)
+# pred2 = pred ? Perfecto:
+sum(abs(pred2-pred))
+
+```
