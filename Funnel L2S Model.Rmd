@@ -9,10 +9,6 @@ output:
 fontsize: 10pt
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 ## Modelo Lead To Sale (L2S)
 
 En este documento resumiré los pasos seguidos para la generación del score generado con el **Funnel L2S Model** de X empresa, en el cual logramos calcular cuál es la probabilidad de que un lead o una oportunidad nueva vaya a convertir (comprar una póliza todo riesgo) y poder tomar mejores decisiones basadas en Machine Learning.
@@ -38,20 +34,6 @@ Luego, se trajo la data del servidor a R directamente usando **PostgreSQL** (se 
 
 1. **Emitidas (1)**: toda la data de todas las oportunidades que fueron emitidas entre el '2016-01-01' y '2017-01-27' (3 semanas antes de la generación del sample).
 2. **No emitidas (0)**: selección aleatoria de oportuniades, dentro del mismo rango de fechas que no fueron emitidas, limitado a 5000.
-
-```{r include=FALSE}
-setwd("/Users/bernardo/Dropbox (ID)/CM Analisis/Model 2017/Funnel L2S Scoring/R Markdown/")
-
-drv <- dbDriver("PostgreSQL")
-con <- dbConnect(drv, 
-                 host="172.30.0.113", 
-                 dbname="sd", 
-                 port="5432", 
-                 user="oisdfhsbcsdsio", 
-                 password="b34678wtbiu3")
-
-```
-
 
 ```{r include=TRUE}
 ## EMITIDAS
